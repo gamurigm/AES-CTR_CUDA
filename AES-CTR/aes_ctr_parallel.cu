@@ -5,13 +5,27 @@
 #include <chrono>
 #include <iomanip>
 #include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+// Constantes para CUDA
+#define BLOCK_SIZE 256
+#define MAX_BLOCKS 65535
+
+// Error checking macro for CUDA
+#define CHECK_CUDA(call) { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        std::cerr << "CUDA error in " << __FILE__ << ":" << __LINE__ << ": " << cudaGetErrorString(err) << std::endl; \
+        exit(1); \
+    } \
+}
 
 // Constantes del dispositivo
 __constant__ uint8_t d_SBOX[256];
 __constant__ uint8_t d_RCON[10];
 __constant__ uint8_t d_MIX_COLUMNS_MATRIX[4][4];
 
-// S-box y otras constantes en el host (igual que en el código original)
+// S-box para SubBytes (host)
 const uint8_t h_SBOX[256] = {
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -29,10 +43,12 @@ const uint8_t h_SBOX[256] = {
     0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e
 };
 
+// Rcon (host)
 const uint8_t h_RCON[10] = {
     0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
 };
 
+// Matriz MixColumns (host)
 const uint8_t h_MIX_COLUMNS_MATRIX[4][4] = {
     {0x02, 0x03, 0x01, 0x01},
     {0x01, 0x02, 0x03, 0x01},
@@ -40,7 +56,7 @@ const uint8_t h_MIX_COLUMNS_MATRIX[4][4] = {
     {0x03, 0x01, 0x01, 0x02}
 };
 
-// Funciones auxiliares en el dispositivo
+// Funciones device para operaciones AES
 __device__ uint8_t gmul(uint8_t a, uint8_t b) {
     uint8_t p = 0;
     uint8_t counter;
@@ -66,14 +82,14 @@ __device__ void sub_bytes(uint8_t state[4][4]) {
 __device__ void shift_rows(uint8_t state[4][4]) {
     uint8_t temp;
     
-    // Fila 1
+    // Row 1
     temp = state[1][0];
     state[1][0] = state[1][1];
     state[1][1] = state[1][2];
     state[1][2] = state[1][3];
     state[1][3] = temp;
     
-    // Fila 2
+    // Row 2
     temp = state[2][0];
     state[2][0] = state[2][2];
     state[2][2] = temp;
@@ -81,7 +97,7 @@ __device__ void shift_rows(uint8_t state[4][4]) {
     state[2][1] = state[2][3];
     state[2][3] = temp;
     
-    // Fila 3
+    // Row 3
     temp = state[3][3];
     state[3][3] = state[3][2];
     state[3][2] = state[3][1];
@@ -115,34 +131,33 @@ __device__ void add_round_key(uint8_t state[4][4], const uint32_t* round_key) {
 }
 
 // Kernel principal para AES-CTR
-__global__ void aes_ctr_kernel(
-    const uint8_t* input,
-    uint8_t* output,
-    const uint32_t* expanded_key,
-    const uint8_t* nonce,
-    unsigned long long total_blocks
-) {
-    unsigned long long block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (block_idx >= total_blocks) return;
-
-    // Preparar el contador para este bloque
+__global__ void aes_ctr_kernel(const uint8_t* input, uint8_t* output, const uint32_t* expanded_key,
+                              const uint8_t* nonce, unsigned long long len) {
+    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (len + 15) / 16) return;
+    
     uint8_t counter[16];
     memcpy(counter, nonce, 12);
-    uint32_t block_counter = block_idx;
+    
+    // Set counter value for this block
+    uint32_t block_counter = idx;
     counter[12] = (block_counter >> 24) & 0xFF;
     counter[13] = (block_counter >> 16) & 0xFF;
     counter[14] = (block_counter >> 8) & 0xFF;
     counter[15] = block_counter & 0xFF;
-
-    // State array para el proceso de encriptación
+    
     uint8_t state[4][4];
+    uint8_t keystream[16];
+    
+    // Initialize state from counter
     for(int i = 0; i < 4; i++)
         for(int j = 0; j < 4; j++)
             state[j][i] = counter[i*4 + j];
-
-    // Proceso de encriptación AES
+    
+    // Initial round
     add_round_key(state, expanded_key);
     
+    // Main rounds
     for(int round = 1; round < 10; round++) {
         sub_bytes(state);
         shift_rows(state);
@@ -150,66 +165,72 @@ __global__ void aes_ctr_kernel(
         add_round_key(state, expanded_key + round*4);
     }
     
+    // Final round
     sub_bytes(state);
     shift_rows(state);
     add_round_key(state, expanded_key + 40);
-
-    // XOR con el input
-    unsigned long long base_idx = block_idx * 16;
-    for(int i = 0; i < 4; i++) {
-        for(int j = 0; j < 4; j++) {
-            unsigned long long idx = base_idx + i*4 + j;
-            if(idx < total_blocks * 16) {
-                output[idx] = input[idx] ^ state[j][i];
-            }
-        }
+    
+    // Copy state to keystream
+    for(int i = 0; i < 4; i++)
+        for(int j = 0; j < 4; j++)
+            keystream[i*4 + j] = state[j][i];
+    
+    // XOR with input
+    unsigned long long base = idx * 16;
+    for(int i = 0; i < 16 && base + i < len; i++) {
+        output[base + i] = input[base + i] ^ keystream[i];
     }
+    
 }
 
 class AES_CTR_CUDA {
 private:
-    std::vector<uint32_t> expanded_key;
-    std::vector<uint8_t> nonce;
     uint32_t* d_expanded_key;
     uint8_t* d_nonce;
+    std::vector<uint32_t> h_expanded_key;
 
     void expand_key(const uint8_t* key) {
-        expanded_key.resize(44);
-        
-        for(int i = 0; i < 4; i++) {
-            expanded_key[i] = (key[4*i] << 24) | (key[4*i+1] << 16) | 
-                             (key[4*i+2] << 8) | key[4*i+3];
+        h_expanded_key.resize(44);
+
+        // First 4 words are the original key
+        for (int i = 0; i < 4; i++) {
+            h_expanded_key[i] = (key[4 * i] << 24) | (key[4 * i + 1] << 16) |
+                                (key[4 * i + 2] << 8) | key[4 * i + 3];
         }
-        
-        for(int i = 4; i < 44; i++) {
-            uint32_t temp = expanded_key[i-1];
-            if(i % 4 == 0) {
+
+        // Expand the rest of the key
+        for (int i = 4; i < 44; i++) {
+            uint32_t temp = h_expanded_key[i - 1];
+            if (i % 4 == 0) {
                 temp = ((temp << 8) | (temp >> 24)) & 0xFFFFFFFF;
-                uint8_t* temp_bytes = (uint8_t*)&temp;
-                for(int j = 0; j < 4; j++)
+                uint8_t* temp_bytes = reinterpret_cast<uint8_t*>(&temp);
+                for (int j = 0; j < 4; j++) {
                     temp_bytes[j] = h_SBOX[temp_bytes[j]];
-                temp ^= h_RCON[i/4 - 1] << 24;
+                }
+                temp ^= h_RCON[i / 4 - 1] << 24;
             }
-            expanded_key[i] = expanded_key[i-4] ^ temp;
+            h_expanded_key[i] = h_expanded_key[i - 4] ^ temp;
         }
+
+        // Copy expanded key to device
+        CHECK_CUDA(cudaMalloc(&d_expanded_key, 44 * sizeof(uint32_t)));
+        CHECK_CUDA(cudaMemcpy(d_expanded_key, h_expanded_key.data(),
+                              44 * sizeof(uint32_t), cudaMemcpyHostToDevice));
     }
 
 public:
-    AES_CTR_CUDA(const uint8_t* key, const uint8_t* init_nonce) : nonce(12) {
-        // Inicializar constantes en el dispositivo
-        cudaMemcpyToSymbol(d_SBOX, h_SBOX, sizeof(h_SBOX));
-        cudaMemcpyToSymbol(d_RCON, h_RCON, sizeof(h_RCON));
-        cudaMemcpyToSymbol(d_MIX_COLUMNS_MATRIX, h_MIX_COLUMNS_MATRIX, sizeof(h_MIX_COLUMNS_MATRIX));
+    AES_CTR_CUDA(const uint8_t* key, const uint8_t* nonce) {
+        // Copy constants to device
+        CHECK_CUDA(cudaMemcpyToSymbol(d_SBOX, h_SBOX, sizeof(h_SBOX)));
+        CHECK_CUDA(cudaMemcpyToSymbol(d_RCON, h_RCON, sizeof(h_RCON)));
+        CHECK_CUDA(cudaMemcpyToSymbol(d_MIX_COLUMNS_MATRIX, h_MIX_COLUMNS_MATRIX, sizeof(h_MIX_COLUMNS_MATRIX)));
 
-        // Expandir clave y copiar al dispositivo
+        // Expand key
         expand_key(key);
-        cudaMalloc(&d_expanded_key, expanded_key.size() * sizeof(uint32_t));
-        cudaMemcpy(d_expanded_key, expanded_key.data(), expanded_key.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
-        // Copiar nonce al dispositivo
-        memcpy(nonce.data(), init_nonce, 12);
-        cudaMalloc(&d_nonce, 12);
-        cudaMemcpy(d_nonce, nonce.data(), 12, cudaMemcpyHostToDevice);
+        // Copy nonce to device
+        CHECK_CUDA(cudaMalloc(&d_nonce, 12));
+        CHECK_CUDA(cudaMemcpy(d_nonce, nonce, 12, cudaMemcpyHostToDevice));
     }
 
     ~AES_CTR_CUDA() {
@@ -217,83 +238,152 @@ public:
         cudaFree(d_nonce);
     }
 
-    void process(const uint8_t* input, uint8_t* output, unsigned long long len) {
-        unsigned long long total_blocks = (len + 15) / 16;
-        
-        // Asignar memoria en el dispositivo
+    static std::vector<uint8_t> generate_nonce() {
+        std::vector<uint8_t> nonce(12);
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, 255);
+
+        for (int i = 0; i < 12; i++) {
+            nonce[i] = dis(gen);
+        }
+        return nonce;
+    }
+
+    void process(const uint8_t* input, uint8_t* output, unsigned long long total_len) {
+        // Tamaño de chunk basado en la memoria disponible de la GPU (por ejemplo, 1GB)
+        const unsigned long long CHUNK_SIZE = 1ULL * 1024 * 1024 * 1024; // 1GB
         uint8_t *d_input, *d_output;
-        cudaMalloc(&d_input, len);
-        cudaMalloc(&d_output, len);
-        
-        // Copiar datos de entrada al dispositivo
-        cudaMemcpy(d_input, input, len, cudaMemcpyHostToDevice);
-        
-        // Configurar y lanzar kernel
-        int block_size = 256;
-        int grid_size = (total_blocks + block_size - 1) / block_size;
-        
-        aes_ctr_kernel<<<grid_size, block_size>>>(
-            d_input, d_output, d_expanded_key, d_nonce, total_blocks
-        );
-        
-        // Copiar resultado de vuelta al host
-        cudaMemcpy(output, d_output, len, cudaMemcpyDeviceToHost);
-        
-        // Liberar memoria
-        cudaFree(d_input);
-        cudaFree(d_output);
+
+        // Allocate fixed device memory for chunks
+        CHECK_CUDA(cudaMalloc(&d_input, CHUNK_SIZE));
+        CHECK_CUDA(cudaMalloc(&d_output, CHUNK_SIZE));
+
+        // Create CUDA streams for overlapping
+        cudaStream_t stream1, stream2;
+        CHECK_CUDA(cudaStreamCreate(&stream1));
+        CHECK_CUDA(cudaStreamCreate(&stream2));
+
+        // Process in chunks
+        for (unsigned long long offset = 0; offset < total_len; offset += CHUNK_SIZE) {
+            unsigned long long current_chunk_size = std::min(CHUNK_SIZE, total_len - offset);
+
+            // Calculate grid dimensions for this chunk
+            unsigned long long num_blocks = (current_chunk_size + 15) / 16;
+            dim3 block_dim(BLOCK_SIZE);
+            dim3 grid_dim((num_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+            // Use alternating streams for overlap
+            cudaStream_t current_stream = (offset / CHUNK_SIZE % 2 == 0) ? stream1 : stream2;
+
+            // Async copy input chunk to device
+            CHECK_CUDA(cudaMemcpyAsync(d_input, input + offset,
+                                       current_chunk_size, cudaMemcpyHostToDevice,
+                                       current_stream));
+
+            // Process chunk
+            aes_ctr_kernel<<<grid_dim, block_dim, 0, current_stream>>>(
+                d_input,
+                d_output,
+                d_expanded_key,
+                d_nonce,
+                current_chunk_size
+            );
+
+            // Async copy output chunk back to host
+            CHECK_CUDA(cudaMemcpyAsync(output + offset, d_output,
+                                       current_chunk_size, cudaMemcpyDeviceToHost,
+                                       current_stream));
+        }
+
+        // Synchronize all streams
+        CHECK_CUDA(cudaStreamSynchronize(stream1));
+        CHECK_CUDA(cudaStreamSynchronize(stream2));
+
+        // Cleanup streams
+        CHECK_CUDA(cudaStreamDestroy(stream1));
+        CHECK_CUDA(cudaStreamDestroy(stream2));
+
+        // Free device memory
+        CHECK_CUDA(cudaFree(d_input));
+        CHECK_CUDA(cudaFree(d_output));
     }
 };
 
+
 int main() {
-    // Clave de ejemplo
-    uint8_t key[16] = {
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-    };
-
-    // Generar nonce
-    std::vector<uint8_t> nonce(12);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 255);
-    for(int i = 0; i < 12; i++) {
-        nonce[i] = dis(gen);
-    }
-
-    // Crear instancia de AES-CTR CUDA
-    AES_CTR_CUDA aes(key, nonce.data());
-
-    // Tamaños de prueba
-    std::vector<unsigned long long> message_sizes = {
-        1ULL * 1024 * 1024,              // 1MB
-        10ULL * 1024 * 1024,             // 10MB
-        1ULL * 1024 * 1024 * 1024,       // 1GB
-        10ULL * 1024 * 1024 * 1024       // 10GB
-    };
-
-    for (unsigned long long size : message_sizes) {
-        // Crear mensaje de prueba
-        std::vector<uint8_t> message(size, 'A');
-        std::vector<uint8_t> ciphertext(size);
-
-        // Medir tiempo
-        auto start = std::chrono::high_resolution_clock::now();
+    try {
+        // Initialize CUDA and get device properties
+        cudaDeviceProp prop;
+        CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+        std::cout << "Using GPU: " << prop.name << std::endl;
         
-        aes.process(message.data(), ciphertext.data(), size);
-        
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        // Key (128 bits)
+        uint8_t key[16] = {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+        };
 
-        // Calcular y mostrar estadísticas
-        double mbps = (size * 8.0 / 1000000.0) / (duration.count() / 1000000.0);
+        // Generate random nonce
+        auto nonce = AES_CTR_CUDA::generate_nonce();
 
-        std::cout << "Tamaño del mensaje: " << std::fixed << std::setprecision(2) 
-                  << (size / 1024.0 / 1024.0) << " MB" << std::endl;
-        std::cout << "Tiempo de encriptación: " << duration.count() / 1000.0 << " ms" << std::endl;
-        std::cout << "Velocidad: " << mbps << " Mbps" << std::endl;
-        std::cout << "-------------------" << std::endl;
+        // Create CUDA AES-CTR instance
+        AES_CTR_CUDA aes(key, nonce.data());
+
+        // Test sizes
+        std::vector<unsigned long long> message_sizes = {
+            1ULL * 1024 * 1024,              // 1MB
+            10ULL * 1024 * 1024,             // 10MB
+            1ULL * 1024 * 1024 * 1024,       // 1GB
+            8ULL * 1024 * 1024 * 1024        // 4GB
+        };
+
+        for (unsigned long long size : message_sizes) {
+            try {
+                std::cout << "\nProcessing " << (size / (1024.0 * 1024.0)) << " MB..." << std::endl;
+                
+                // Create test vectors with regular memory
+                std::vector<uint8_t> message, ciphertext;
+                message.resize(size, 'A');
+                ciphertext.resize(size);
+
+                // Measure encryption time
+                auto start = std::chrono::high_resolution_clock::now();
+                
+                aes.process(message.data(), ciphertext.data(), size);
+                
+                // Ensure all GPU operations are complete
+                CHECK_CUDA(cudaDeviceSynchronize());
+                
+                auto end = std::chrono::high_resolution_clock::now();
+                auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+                // Calculate speed
+                double gbps = (size * 8.0 / 1000000000.0) / (duration.count() / 1000000.0);
+
+                std::cout << "Encryption time: " << std::fixed << std::setprecision(2) 
+                            << duration.count() / 1000.0 << " ms" << std::endl;
+                std::cout << "Speed: " << gbps << " Gbps" << std::endl;
+                std::cout << "-------------------" << std::endl;
+
+                // Clear vectors to free memory immediately
+                message.clear();
+                message.shrink_to_fit();
+                ciphertext.clear();
+                ciphertext.shrink_to_fit();
+                
+            } catch (const std::bad_alloc& e) {
+                std::cerr << "Memory allocation failed for size " << (size / (1024.0 * 1024.0)) 
+                            << " MB: " << e.what() << std::endl;
+                continue;
+            }
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
 
     return 0;
 }
+
