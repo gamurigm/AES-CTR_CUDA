@@ -270,7 +270,7 @@ int main() {
         1ULL * 1024 * 1024,              // 1MB
         10ULL * 1024 * 1024,             // 10MB
         1ULL * 1024 * 1024 * 1024,       // 1GB
-        10ULL * 1024 * 1024 * 1024       // 10GB
+          
     };
 
     for (unsigned long long size : message_sizes) {

@@ -188,6 +188,8 @@ private:
     uint32_t* d_expanded_key;
     uint8_t* d_nonce;
     std::vector<uint32_t> h_expanded_key;
+    static constexpr int NUM_STREAMS = 2;
+    cudaStream_t streams[NUM_STREAMS];
 
     void expand_key(const uint8_t* key) {
         h_expanded_key.resize(44);
@@ -231,11 +233,19 @@ public:
         // Copy nonce to device
         CHECK_CUDA(cudaMalloc(&d_nonce, 12));
         CHECK_CUDA(cudaMemcpy(d_nonce, nonce, 12, cudaMemcpyHostToDevice));
+
+        // Create CUDA streams
+        for (int i = 0; i < NUM_STREAMS; i++) {
+            CHECK_CUDA(cudaStreamCreate(&streams[i]));
+        }
     }
 
     ~AES_CTR_CUDA() {
         cudaFree(d_expanded_key);
         cudaFree(d_nonce);
+        for (int i = 0; i < NUM_STREAMS; i++) {
+            CHECK_CUDA(cudaStreamDestroy(streams[i]));
+        }
     }
 
     static std::vector<uint8_t> generate_nonce() {
@@ -251,64 +261,46 @@ public:
     }
 
     void process(const uint8_t* input, uint8_t* output, unsigned long long total_len) {
-        // Tamaño de chunk basado en la memoria disponible de la GPU (por ejemplo, 1GB)
         const unsigned long long CHUNK_SIZE = 1ULL * 1024 * 1024 * 1024; // 1GB
         uint8_t *d_input, *d_output;
 
-        // Allocate fixed device memory for chunks
         CHECK_CUDA(cudaMalloc(&d_input, CHUNK_SIZE));
         CHECK_CUDA(cudaMalloc(&d_output, CHUNK_SIZE));
 
-        // Create CUDA streams for overlapping
-        cudaStream_t stream1, stream2;
-        CHECK_CUDA(cudaStreamCreate(&stream1));
-        CHECK_CUDA(cudaStreamCreate(&stream2));
+        for (unsigned long long offset = 0; offset < total_len; offset += CHUNK_SIZE * NUM_STREAMS) {
+            for (int i = 0; i < NUM_STREAMS && offset + i * CHUNK_SIZE < total_len; i++) {
+                unsigned long long current_chunk_size = std::min(CHUNK_SIZE, total_len - (offset + i * CHUNK_SIZE));
+                unsigned long long num_blocks = (current_chunk_size + 15) / 16;
+                dim3 block_dim(BLOCK_SIZE);
+                dim3 grid_dim((num_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE);
+                cudaStream_t current_stream = streams[i];
 
-        // Process in chunks
-        for (unsigned long long offset = 0; offset < total_len; offset += CHUNK_SIZE) {
-            unsigned long long current_chunk_size = std::min(CHUNK_SIZE, total_len - offset);
+                CHECK_CUDA(cudaMemcpyAsync(d_input, input + offset + i * CHUNK_SIZE,
+                                           current_chunk_size, cudaMemcpyHostToDevice,
+                                           current_stream));
 
-            // Calculate grid dimensions for this chunk
-            unsigned long long num_blocks = (current_chunk_size + 15) / 16;
-            dim3 block_dim(BLOCK_SIZE);
-            dim3 grid_dim((num_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE);
+                aes_ctr_kernel<<<grid_dim, block_dim, 0, current_stream>>>(
+                    d_input,
+                    d_output,
+                    d_expanded_key,
+                    d_nonce,
+                    current_chunk_size
+                );
 
-            // Use alternating streams for overlap
-            cudaStream_t current_stream = (offset / CHUNK_SIZE % 2 == 0) ? stream1 : stream2;
-
-            // Async copy input chunk to device
-            CHECK_CUDA(cudaMemcpyAsync(d_input, input + offset,
-                                       current_chunk_size, cudaMemcpyHostToDevice,
-                                       current_stream));
-
-            // Process chunk
-            aes_ctr_kernel<<<grid_dim, block_dim, 0, current_stream>>>(
-                d_input,
-                d_output,
-                d_expanded_key,
-                d_nonce,
-                current_chunk_size
-            );
-
-            // Async copy output chunk back to host
-            CHECK_CUDA(cudaMemcpyAsync(output + offset, d_output,
-                                       current_chunk_size, cudaMemcpyDeviceToHost,
-                                       current_stream));
+                CHECK_CUDA(cudaMemcpyAsync(output + offset + i * CHUNK_SIZE, d_output,
+                                           current_chunk_size, cudaMemcpyDeviceToHost,
+                                           current_stream));
+            }
+            for (int i = 0; i < NUM_STREAMS; i++) {
+                CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+            }
         }
 
-        // Synchronize all streams
-        CHECK_CUDA(cudaStreamSynchronize(stream1));
-        CHECK_CUDA(cudaStreamSynchronize(stream2));
-
-        // Cleanup streams
-        CHECK_CUDA(cudaStreamDestroy(stream1));
-        CHECK_CUDA(cudaStreamDestroy(stream2));
-
-        // Free device memory
         CHECK_CUDA(cudaFree(d_input));
         CHECK_CUDA(cudaFree(d_output));
     }
 };
+
 
 
 int main() {
@@ -335,7 +327,7 @@ int main() {
             1ULL * 1024 * 1024,              // 1MB
             10ULL * 1024 * 1024,             // 10MB
             1ULL * 1024 * 1024 * 1024,       // 1GB
-            8ULL * 1024 * 1024 * 1024        // 4GB
+            6ULL * 1024 * 1024 * 1024        // 6GB
         };
 
         for (unsigned long long size : message_sizes) {
